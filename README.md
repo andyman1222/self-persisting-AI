@@ -1,0 +1,2 @@
+# self persisting AI
+ 
