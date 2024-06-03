@@ -1,15 +1,15 @@
-# Self persisting AI
+# Self Persisting AI
 
 Making an AI that learns to keep itself open.
 
-## Command args:
+## Command args
 * "-t" enables test mode (disables learning, relies on previous training only; default with no arg is training mode)
 * "-a" enables the auto bot (some scripting in the code that moves the mouse constantly to the window's x)
 
-## **Warning:**
+## **Warning**
 This program takes over your mouse via movement (thus demonstrating the importance of adding permissions to restrict programs from controlling/simulating HID interfaces like the mouse, keyboard, and volume buttons, something which no OS seems to implement.)
 
-## **Shutting down without impacting the AI:**
+## **Shutting down without impacting the AI**
 hold escape to stop the program, or attempt to click the button inside the window (depending on the training and python debug config, this might not be doable; but escape should always work). Closing the window other ways may trigger the WM_DELETE_WINDOW protocol which adds another result to the AI (if in training mode)
 
 ## Information
