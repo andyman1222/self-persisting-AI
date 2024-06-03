@@ -1,4 +1,4 @@
-# self persisting AI
+# Self persisting AI
 
 Making an AI that learns to keep itself open.
 
