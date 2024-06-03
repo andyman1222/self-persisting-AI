@@ -3,7 +3,7 @@
 Making an AI that learns to keep itself open.
 
 ## Command args
-* "-t" enables test mode (disables learning, relies on previous training only; default with no arg is training mode)
+* "-t" enables test mode (disables learning, relies on previous training only; default with no arg is training mode; this mode doesn't seem to work as the AI seems to take no actions)
 * "-a" enables the auto bot (some scripting in the code that moves the mouse constantly to the window's x)
 
 ## **Warning**
