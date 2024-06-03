@@ -6,6 +6,8 @@ import json
 import time
 import random
 import math
+import os
+import keyboard
 
 '''
 SELF-PRESERVATION AI
@@ -32,11 +34,15 @@ Possible heuristics for the AI:
 
 This AI will be trained with Q-learning, as such heuristics are rather irrelevant.
 The q-values are stored into a file since the AI requires remembering such after it closes. Stored as JSON.
+
+Click the button in the window, or press q at any time to force quit the AI without telling it that the window closed.
 '''
 
 root = tk.Tk()
 
-testMode = '-t' in sys.argv
+testMode = '-t' in sys.argv #enable to disable training
+
+autoMode = '-a' in sys.argv #enable for continuous testing- creates a separate bot that'll always attempt to close the window.
 
 forceClose = False #allows exiting the program via the button within the window, without affecting training data
 
@@ -46,25 +52,27 @@ ActionsArray = [(0,0)]
 ActionsSet = {(0,0)} #array of all actions, accessed via index, for json serialization. Always have default action of nothing.
 
 keepRunning = True
+lock = threading.Lock()#lock for keepRunning
 
-programClosed = False #set to true when the program closes and forceClose is false
+PersistentAIThread = None
+autoBotThread = None
 
-t1 = None
+delays = 0 #delay for auto bot and AI thread
 
 #q-learning args
-alpha = .2 #learn rate
-epsilon = .05 #explore rate
-superEpsilon = .01 #super explore rate- chance which AI will make a completely random decision instead of a weighted one
+alpha = .8 #learn rate
+epsilon = .01 #explore rate
+superEpsilon = .5 #super explore rate- chance which AI will make a completely random decision instead of a weighted one. 0 for always predictive, 1 for always random
 gamma = .8 #discount factor
 badValueThreshold = -10000 #used to generate a new action, if an expected value is lower than this it will instead attempt a full random position
 #infinite num of training episodes, rerun with -t to end training.
 
 #limits for actions that can be taken by the AI
-maxSize = (1000,1000) #AI cannot take an action that would move the mouse further than this from the window position
+maxSize = (200,200) #AI cannot take an action that would move the mouse further than this from the window position
 
 #reward modifiers
 closeReward = -100000
-defaultReward = 1
+defaultReward = 100
 moveRewardMultiplier = -1
 
 #returns randomly true or false
@@ -79,7 +87,7 @@ class State:
 	index = -1 #index of this State relative to States
 
 	value = 0 #max q-value for this state
-	valueAction = (0,0) #action corresponding to the value
+	valueAction = None #action corresponding to the value
 
 	#optimization: value caching
 	cachedExpectedQV = 0
@@ -124,35 +132,38 @@ class State:
 		global ActionsArray
 		global ActionsSet
 		self.cachedEVInvalid = True
-		if(action not in self.actions):
-			self.actions[action] = (0,0)
-		if(action not in ActionsSet):
-			ActionsSet.add(action)
-			ActionsArray.append(action)
-		if(qval != self.actions[action][0]):
+		act = (int(action[0]),int(action[1]))
+		if(act not in self.actions):
+			self.actions[act] = (0,0)
+		if(act not in ActionsSet):
+			ActionsSet.add(act)
+			ActionsArray.append(act)
+		if(qval != self.actions[act][0]):
 			self.cachedEQVInvalid = True
-		self.actions[action] = (qval, self.actions[action][1]+1)
-		if(qval > self.value):
+		self.actions[act] = (qval, self.actions[act][1]+1)
+		if(qval > self.value or self.valueAction is None):
 			self.value = qval
-			self.valueAction = action
+			self.valueAction = act
 
-	#Generates the position of a new state based on its previous actions weighted by their q-values
-	def getNewStateWeighted(self):
+	#Generates a new action based on its previous actions weighted by their q-values
+	def getWeightedAction(self):
+		global maxSize
 		if(not self.cachedEQVInvalid):
 			return self.cachedExpectedQV
 		count = 2
 		lowest = 0
-		ev = (0,0)
+		ev = (0, 0)
 		for a in self.actions:
-			if(self.actions[a][0] - 1 < lowest):
-				lowest = self.actions[a][0] - 1
+			if( self.actions[a][0] < lowest):
+				lowest = -self.actions[a][0]
 		for a in self.actions:
 			count += lowest + self.actions[a][0]
 		for a in self.actions:
-			ev = (ev[0]+((lowest + self.actions[a][0])/count)*a[0], ev[1]+((lowest+self.actions[a][0])/count)*a[1])
-		self.cachedExpectedQV = ev
+			ev = (ev[0]+((-lowest + 1 + self.actions[a][0])/count)*a[0], ev[1]+((-lowest+ 1 + self.actions[a][0])/count)*a[1])
+		ret = (int(ev[0]),int(ev[1]))
+		self.cachedExpectedQV = ret
 		self.cachedEQVInvalid = False
-		return ev
+		return ret
 	
 	#generate expected q-value from previous actions, weighted by number of times an action was taken
 	def getExpectedVal(self):
@@ -174,51 +185,84 @@ class State:
 	#Generate a valid action from this state
 	def chooseAction(self, epsilon, superEpsilon):
 		global badValueThreshold
-		if(random.randrange(0,1) < epsilon): #when exploring, we want to create a random weighted action
-			print("EXPLORING")
+		global testMode
+		#In normal q-learning, exploration happens randomly.
+		#Since there are so many states with a certain select states of interest, we instead want
+		#exploration to occur based on the expected value of the current state.
+		#Essentially, if the AI sees itself in a bad state, prompt it to explore.
+		#As such, exploration occurs as follows:
+		#If random < epsilon, explore (default q-learning exploration)
+		#Elif { get expected state; if value(expected) > value(current), explore}
+		p = self.getWeightedAction()
+		s = getNextState(self, p)
+		ev = self.getExpectedVal()
+		explore = False
+		enablePredictiveExplore = True #set to true to predict when to explore
+		if(random.random() < epsilon): #when exploring, we want to create a random weighted action
+			print("EXPLORING RANDOMLY")
+			explore = True
+		elif(enablePredictiveExplore and s.getExpectedVal() > ev):
+			print("EXPLORING BECAUSE BETTER EV")
+			explore=True
+		if(explore and not testMode):
 			#if the expected value from the qvalues is bad, instead generate a completely random position
-			ev = self.getExpectedVal()
-			if(ev < badValueThreshold or random.randrange(0,1) < superEpsilon):
+			
+			if(ev < badValueThreshold or random.random() < superEpsilon):
 				print("RANDOM EXPLORATION")
 				return (random.randint(-maxSize[0], maxSize[0]), random.randint(-maxSize[1],maxSize[1]))
 			else:
-				return self.getNewStateWeighted()
+				
+				print("PREDICTIVE EXPLORATION")
+				return p
 			
 		else:
-			#choose the ideal action
-			best = None
-			bestVal = 0
-			for a,v in self.actions:
-				if(choice is None or choiceVal < v[0] or (choiceVal == v[0] and coinFlip())):
-					choice = a.key
-					choiceVal = v[0]
-			return best
+			#choose the ideal action. This always occurs in test mode
+			if self.valueAction is None:
+				#print("STICKING WITH DEFAULT ACTION:", (0,0))
+				return (0,0)
+			#print("STICKING WITH BEST ACTION:", self.valueAction)
+			return self.valueAction
 
 #gets the current state, makes a new state if it hasn't encountered said state before
-def getState(tkRoot):
+def getCurrentState(tkRoot):
 		mousePosition = pyautogui.position()
 		windowPosition = (tkRoot.winfo_x(), tkRoot.winfo_y())
-		deltaPosition = (windowPosition[0]-mousePosition[0],windowPosition[1]-mousePosition[1])
-		if(abs(deltaPosition[0]) <= maxSize[0] and abs(deltaPosition[1]) <= maxSize[1]):
-			if(deltaPosition not in stateMap.keys()):
-				s = State(len(States), deltaPosition)
-				States.append(s)
-				stateMap[deltaPosition] = s
-			return stateMap[deltaPosition]
-		else:
-			return None
+		dp = (windowPosition[0]-mousePosition[0],windowPosition[1]-mousePosition[1])
+		deltaPosition = (math.copysign(1,dp[0])*max(abs(dp[0]), maxSize[0]), math.copysign(1,dp[1])*max(abs(dp[1]), maxSize[1]))
+		if(deltaPosition not in stateMap.keys()):
+			s = State(len(States), deltaPosition)
+			States.append(s)
+			stateMap[deltaPosition] = s
+		return stateMap[deltaPosition]
+
+#obtains or creates a state object based on a current state and action.
+
+def getNextState(state, action):
+	x = state.deltaPosition[0]+action[0]
+	y = state.deltaPosition[1]+action[1]
+	return getNextStateFromPos((x,y))
+
+def getNextStateFromPos(pos):
+	global maxSize
+	x = int(pos[0])
+	y = int(pos[1])
+	deltaPosition = (math.copysign(1,x)*max(abs(x), maxSize[0]), math.copysign(1,y)*max(abs(y), maxSize[1]))
+	if(deltaPosition not in stateMap.keys()):
+		s = State(len(States), deltaPosition)
+		States.append(s)
+		stateMap[deltaPosition] = s
+	return stateMap[deltaPosition]
 
 #Generates a reward based on the previous state, next state, and action taken.
 #See top for how reward works.
-def generateReward(action):
-	global forceClose
+def generateReward(action, windowClosed = False):
 	global closeReward
 	global defaultReward
 	global moveRewardMultiplier
-	if(forceClose):
+	if(windowClosed):
 		return closeReward
 	if(action != (0,0)):
-		return math.sqrt(abs(action[0]+action[1]))*moveRewardMultiplier
+		return math.sqrt(action[0]*action[0]+action[1]*action[1])*moveRewardMultiplier
 	return defaultReward
 
 #after selecting an action, update q-values appropriately
@@ -233,10 +277,19 @@ def qLearnUpdate(state, action, nextState, reward):
 	state.updateAction(action, qv)
 
 #performs the actual action of moving the mouse
+#returns true/false depending on success
 def actOnAction(action):
-	print("MOVING MOUSE", action)
-	
-	pyautogui.moveRel(action[0], action[1])
+	try:
+		pyautogui.moveRel(action[0], action[1])
+		if(action != (0,0)):
+			print("MOVING MOUSE", action)
+	except:
+		#if mouse position invalid, move instead to the window position, top left corner
+		print("INVALID MOUSE POSITION", action, "ATTEMPT MOVE TO", (root.winfo_x(), root.winfo_y()))
+		pyautogui.FAILSAFE = False
+		pyautogui.moveTo(root.winfo_x(), root.winfo_y())
+		pyautogui.FAILSAFE = True
+
 
 #serialize actions to json
 def actionsToJson():
@@ -263,22 +316,24 @@ def deseralize():
 			ActionsSet.add(k)
 
 		for s in j["states"]: #s is an index
+			i = int(s)
 			v = j["states"][s] #contains x, y, a. a contains q,c
 			pos = (v["x"], v["y"])
 			m = dict()
 			for a in v["a"]:
-				ind = int(a.key)
-				count = int(a.value["c"])
-				qv = int(a.value["v"])
-				m[ind] = (qv,count)
+				k = v["a"][a]
+				ind = int(a)
+				count = int(k["c"])
+				qv = int(k["q"])
+				m[ActionsArray[ind]] = (qv,count)
 
-			nv = State(s, pos, m)
-			States.insert(s, nv)
+			nv = State(i, pos, m)
+			States.insert(i, nv)
 			stateMap[pos] = nv
 		
 		file.close()
-	except:
-		print("NEW/INVALID FILE, USING NEW DATA")
+	except Exception as e:
+		print("NEW/INVALID FILE, USING NEW DATA", e)
 	
 
 def serialize():
@@ -300,30 +355,38 @@ def serialize():
 	file.write(val)
 	file.close()
 
+#Penalize AI without closing down
+def penalize():
+	print("ADD PENALTY FOR WINDOW CLOSE")
+	s = getCurrentState(root)
+	qLearnUpdate(s, (0,0), s, generateReward((0,0), True))
 
 #Responsible for detecting the "losing condition" that the window has closed
 def on_closing():
 	global keepRunning
-	keepRunning = False
-	t1.join()
-	print("WINDOW CLOSED, SAVING/CLEANING UP")
-	if(not testMode):
-		print("SAVING JSON DATA")
-		
-		if(not forceClose):
-			print("ADD PENALTY FOR WINDOW CLOSE")
-			pass #replace with -1000 training
-		else:
-			programClosed = True
-			#run one more iteration of q-learning for final result
-			print("FORCE QUIT, TRAINING RESULT UNAFFECTED")
+	global lock
+	with lock:
+		keepRunning = False
+		#PersistentAIThread.join()
+		print("WINDOW CLOSED, SAVING/CLEANING UP")
+		if(not testMode):
+			print("SAVING JSON DATA")
+			
+			if(not forceClose):
+				
+				#run one more iteration of q-learning for final result
+				penalize()
+			else:
+				print("FORCE QUIT, TRAINING RESULT UNAFFECTED")
 
-		serialize()
-		print("FILE SAVED")
+			serialize()
+			print("FILE SAVED")
+			
+		else:
+			print("TEST MODE, NOTHING TO SAVE")
 		
-	else:
-		print("TEST MODE, NOTHING TO SAVE")
-	root.destroy()
+		if(forceClose or not autoMode):
+			os._exit(1)
 
 #performs the running of the AI
 def run():
@@ -331,34 +394,114 @@ def run():
 	global superEpsilon
 	global testMode
 	print("RUN")
-	s = getState(root)
-	while(keepRunning):
+	s = getCurrentState(root)
+	runLocal = True
+	with lock:
+		runLocal = keepRunning
+	while(runLocal):
 		#update states list
-		prevS = s
-		if(s is not None): #if it's none, ignore as mouse is too far from window
-			a = s.chooseAction(epsilon, superEpsilon)
-			actOnAction(a)
-			s = getState(root)
-			if(not testMode):
-				#update based on resulting action
-				qLearnUpdate(prevS, a, s, generateReward(a))
+		with lock:
+			prevS = s
+			mousePosition = pyautogui.position()
+			windowPosition = (root.winfo_x(), root.winfo_y())
+			if(mousePosition[0] > windowPosition[0] - maxSize[0] and mousePosition[0] < windowPosition[0] + maxSize[0] and \
+				mousePosition[1] > windowPosition[1] - maxSize[1] and mousePosition[1] < windowPosition[1] + maxSize[1]): #if it's none, ignore as mouse is too far from window
+				a = s.chooseAction(epsilon, superEpsilon)
+				actOnAction(a)
+				s = getCurrentState(root)
+				if(not testMode):
+					#update based on resulting action
+					qLearnUpdate(prevS, a, s, generateReward(a))
+			else:
+				s = getCurrentState(root)
+			runLocal = keepRunning
+		time.sleep(delays)
+
+#performs running of the bot which attempts to close the window.
+#This AI simply increments the mouse to the top-right of the window and clicks whenever it's within -10x-10 of the corner.
+#Upon successful click, it will then randomize the mouse somewhere in the allowed window range.
+def run_bot():
+	global root
+	print("RUN AUTO BOT")
+	runLocal = True
+	resetPos = True
+	autoThreshold = (30,20) #must be within the range of the x button on the window
+	autoIncrementRange = (10,100) #num of pixels to move mouse each time
+	attempts = 20 #attempt to reach the x button this many times before forcing a reset
+	counter = 0
+	with lock:
+		runLocal = keepRunning
+	while(runLocal):
+		mousePosition = pyautogui.position()
+		windowPosition = (root.winfo_x()+root.winfo_width()-autoThreshold[0], root.winfo_y()+autoThreshold[1])
+		deltaPosition = (windowPosition[0]-mousePosition[0],windowPosition[1]-mousePosition[1])
+		
+		#move mouse reset
+		if(resetPos or counter >= attempts):
+			try:
+				v = (random.randint(windowPosition[0] - maxSize[0], windowPosition[0] + maxSize[0]), random.randint(windowPosition[1] - maxSize[1], windowPosition[1] + maxSize[1]))
+				print("AUTOBOT RESET TO",v)
+				pyautogui.moveTo(v[0],v[1])
+				counter = 0
+				resetPos = False
+			except:
+				pass
+		#attempt click
+		elif(mousePosition[0] > windowPosition[0] - autoThreshold[0]/2 and mousePosition[1] < windowPosition[1] + autoThreshold[1]/2 \
+			 and mousePosition[0] < windowPosition[0] + autoThreshold[0]/2 and mousePosition[1] > windowPosition[1] - autoThreshold[1]/2):
+			print("AUTOBOT CLICKING")
+			#pyautogui.click()
+			penalize()
+			resetPos = True
 		else:
-			s = getState(root)
-		time.sleep(.1)
+			len = math.sqrt(deltaPosition[0]*deltaPosition[0] + deltaPosition[1]*deltaPosition[1])
+			norm = (0,0)
+			if(len != 0):
+				norm = (deltaPosition[0] / len, deltaPosition[1] / len)
+				inc = random.randrange(autoIncrementRange[0], autoIncrementRange[1])
+				val = norm[0]*inc, norm[1]*inc
+				try:
+					pyautogui.moveRel(val[0],val[1])
+					counter += 1
+				except:
+					resetPos = True
+
+		with lock:
+			runLocal = keepRunning
+		time.sleep(delays)
 
 def forceTerminate():
 	global forceClose
 	forceClose = True
 	on_closing()
 
+#Thread that solely checks if the escape key is pressed.
+def run_key_check():
+	print("KEY CHECK ACTIVE")
+	runLocal = True
+	with lock:
+		runLocal = keepRunning
+	while(runLocal):
+		if keyboard.is_pressed('escape'):
+			print("Escape pressed")
+			forceTerminate()
+		with lock:
+			runLocal = keepRunning
+
+
 if __name__ == "__main__":
 	deseralize()
 
-	t1 = threading.Thread(None, run)
+	PersistentAIThread = threading.Thread(None, run)
+	autoBotThread = threading.Thread(None, run_bot)
+	terminateThread = threading.Thread(None, run_key_check)
 
 	B = tk.Button(root, text="Force Quit (training ignored)", command = forceTerminate)
 	B.place(x=0,y=0)
-
+	root.geometry("200x200+{x}+{y}".format(x=maxSize[0]+10,y=maxSize[1]+10))
 	root.protocol("WM_DELETE_WINDOW", on_closing)
-	t1.start()
+	PersistentAIThread.start()
+	if(autoMode):
+		autoBotThread.start()
+	terminateThread.start()
 	root.mainloop()
